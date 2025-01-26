@@ -3,3 +3,4 @@ node_modules
 log.txt
 chat_history.json
 chat_history.json.bak
+long_term_memory.json
