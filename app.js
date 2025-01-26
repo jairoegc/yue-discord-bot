@@ -13,9 +13,9 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BOT_NAME = 'Yue';
 const HISTORY_FILE = path.join(__dirname, 'chat_history.json');
 const LOG_FILE = path.join(__dirname, 'log.txt');
-const COOLDOWN_MS = 5000;
+const COOLDOWN_MS = 20000;
 const MAX_HISTORY_LENGTH = 30;
-const SUMMARY_INTERVAL = 12;  // Increased from 8 for less frequent summarization
+const SUMMARY_INTERVAL = 30;  // Increased from 8 for less frequent summarization
 const LONG_TERM_MEMORY_FILE = path.join(__dirname, 'long_term_memory.json');
 const MAX_TOKENS = 6000;  // Used for optimizing token usage in contexts
 
@@ -305,9 +305,11 @@ async function shouldRespond(messageContent) {
       Mensaje: "${messageContent}"
       
       Consideraciones:
-      - Menciones directas (${BOT_NAME}, @${BOT_NAME})
-      - Respuestas para continuar la conversacion segun el contexto y el historial de chat
-      - Preguntas que requieren asistencia
+      - Menciones directas (${BOT_NAME}, @${BOT_NAME}), responde SÍ.
+      - Menciones a mankeke, herni, teto, jairo, kari, max, daniel, @ledah0306, @estejairo, @hillevistka, @herni_o, @tetitowo, @dnl.trrs o @clezzo, responde SÍ
+      - Mensajes relacionados con bots de discord, responde SÍ.
+      - Preguntas relacionadas con la conversacion actual segun el contexto, el historial de chat y tu memoria, responde SÍ.
+      - Preguntas relacionadas con videojuegos, peliculas, cultura geek, anime, musica, twitch, discord y tecnologia, responde SÍ.
       - Saludos generales sin nombres explicitos = NO`
       }],
       model: "deepseek-chat",
@@ -460,10 +462,10 @@ discordClient.on('messageCreate', async (message) => {
   // 1) Quick local check to skip unneeded API calls
   // -----------------------------------
   // If it doesn't contain 'yue' or mention the bot, skip checking with shouldRespond()
-  if (!content.includes('yue') && !message.mentions.has(discordClient.user)) {
-    logEvent('ignore_local', { userId, message: content });
-    return;
-  }
+  //if (!content.includes('yue') && !message.mentions.has(discordClient.user)) {
+  //  logEvent('ignore_local', { userId, message: content });
+  //  return;
+  //}
 
   try {
     // -----------------------------------
