@@ -15,7 +15,7 @@ const HISTORY_FILE = path.join(__dirname, 'chat_history.json');
 const LOG_FILE = path.join(__dirname, 'log.txt');
 const COOLDOWN_MS = 8000;
 const MAX_HISTORY_LENGTH = 30;
-const SUMMARY_INTERVAL = 30; // Summarize less often
+const SUMMARY_INTERVAL = 15; // Summarize less often
 const LONG_TERM_MEMORY_FILE = path.join(__dirname, 'long_term_memory.json');
 const MAX_TOKENS = 6000;
 
@@ -289,79 +289,70 @@ process.on('uncaughtException', async (error) => {
 // -----------------------------------
 // 1) Decision: Should Respond?
 // -----------------------------------
-async function shouldRespond(userId, messageContent) {
-  try {
-    // 1. Retrieve user’s full history
-    const userHistory = chatHistory[userId] || [];
+function shouldRespond(userId, messageContent) {
+  // 1) Define rules and parameters
+  const THIRTY_SECONDS = 30 * 1000; 
+  const now = Date.now();
+  // Lowercase for simpler checks
+  const contentLower = messageContent.toLowerCase();
 
-    // 2. Filter messages to keep only those from the last 5 minutes
-    const FIVE_MINUTES = 5 * 60 * 1000;
-    const now = Date.now();
+  // Topics or user-mentions that should trigger a response
+  const keywords = [
+    // Bot name or direct mention
+    "yue", 
+    // Known members or relevant references:
+    "mankeke", "herni", "teto", "jairo", "kari", "max", "daniel",
+    "ledah0306", "estejairo", "hillevistka", "herni_o", "tetitowo",
+    "dnl.trrs", "clezzo",
+    // Relevant topics:
+    "videojuego", "videojuegos", "pelicula", "películas", "geek", 
+    "anime", "música", "music", "twitch", "discord", "tecnología", 
+    "tecnologia"
+  ];
 
-    const recentHistory = userHistory.filter(entry => {
-      const entryTime = new Date(entry.timestamp).getTime();
-      return (now - entryTime) <= FIVE_MINUTES;
-    });
+  // 2) Get the user's recent history (last 5 minutes)
+  const fullHistory = chatHistory[userId] || [];
+  const recentHistory = fullHistory.filter(msg => {
+    const msgTime = new Date(msg.timestamp).getTime();
+    return (now - msgTime) <= THIRTY_SECONDS;
+  });
 
-    // 3. Take the last 4 messages from the filtered list
-    const recentMessages = recentHistory.slice(-4);
-
-    // 4. Build a short conversation snippet
-    const conversationSnippet = recentMessages.map(entry => {
-      const speaker = entry.role === 'assistant' ? BOT_NAME : entry.username;
-      return `${speaker}: ${entry.content}`;
-    }).join('\n');
-
-    // 5. Create a system prompt with the snippet + new user message
-    const systemPrompt = `
-Eres un sistema que decide si la IA llamada "${BOT_NAME}" debe responder.
-Observa la siguiente conversación reciente (sólo incluye los últimos 5 minutos de mensajes):
-
-${conversationSnippet}
-
-Mensaje nuevo del usuario: "${messageContent}"
-
-Reglas para responder con "SÍ":
-- El usuario está continuando la misma conversación (el último en hablar fue ${BOT_NAME} o el usuario, y el contexto fluye).
-- El usuario está mencionando a ${BOT_NAME} o algún tema directamente dirigido a ${BOT_NAME}.
-- El usuario habla de videojuegos, películas, cultura geek, anime, música, Twitch, Discord, tecnología o se dirige explícitamente a los participantes del servidor.
-- Si el mensaje cumple estas condiciones, di "SÍ". En caso contrario, di "NO".
-Escribe únicamente "SÍ" o "NO" sin explicaciones.
-`;
-
-    const response = await deepseek.chat.completions.create({
-      messages: [
-        {
-          role: "system",
-          content: systemPrompt
-        }
-      ],
-      model: "deepseek-chat",
-      max_tokens: 3,
-      temperature: 0.1
-    });
-
-    const decisionText = response.choices[0].message.content.trim().toUpperCase();
-    const decision = decisionText === 'SÍ';
-
-    logEvent('detection', {
-      userId,
-      message: messageContent,
-      conversationSnippet,
-      decision,
-      rawLLMResponse: decisionText
-    });
-
-    return decision;
-  } catch (error) {
-    logEvent('error', {
-      type: 'detection_error',
-      userId,
-      error: error.message,
-      stack: error.stack
-    });
-    return false;
+  // 3) Check if the last message is from the assistant or the user
+  //    and occurred within 5 minutes (a "continuing conversation")
+  let continuingConversation = false;
+  if (recentHistory.length > 0) {
+    const lastMsg = recentHistory[recentHistory.length - 1];
+    // If the last message is from the assistant or the user themselves,
+    // within 5 minutes, assume it's a continuation
+    if ((lastMsg.role === "assistant" || lastMsg.role === "user") && 
+        (now - new Date(lastMsg.timestamp).getTime()) <= THIRTY_SECONDS) {
+      continuingConversation = true;
+    }
   }
+
+  // 4) Check keyword triggers in the user’s new message
+  let keywordTriggered = false;
+  for (const kw of keywords) {
+    if (contentLower.includes(kw)) {
+      keywordTriggered = true;
+      break;
+    }
+  }
+
+  // 5) Combine logic to decide "SÍ" or "NO"
+  //    If continuing conversation OR keyword triggered => respond
+  const shouldSayYes = (continuingConversation || keywordTriggered);
+
+  // Log for debugging
+  logEvent('detection_local', {
+    userId,
+    message: messageContent,
+    continuingConversation,
+    keywordTriggered,
+    decision: shouldSayYes
+  });
+
+  return shouldSayYes;
 }
 
 // -----------------------------------
@@ -475,20 +466,14 @@ async function generateResponse(userId, message) {
 // -----------------------------------
 // 3) Discord Client Setup
 // -----------------------------------
-discordClient.on('ready', () => {
-  console.log(`${BOT_NAME} is ready!`);
-  logEvent('system', { status: 'bot_ready' });
-});
-
 discordClient.on('messageCreate', async (message) => {
-  // Ignore other bots or if shutting down
   if (message.author.bot || isShuttingDown) return;
 
   const userId = message.author.id;
   const content = message.content.toLowerCase();
 
   try {
-    // Check cooldown
+    // 1) Cooldown check
     if (userCooldowns.has(userId)) {
       const lastTime = userCooldowns.get(userId);
       if (Date.now() - lastTime < COOLDOWN_MS) {
@@ -498,22 +483,47 @@ discordClient.on('messageCreate', async (message) => {
       }
     }
 
-    // Decide if we should respond (now includes recent conversation context).
-    if (!(await shouldRespond(userId, content))) {
+    // 2) Decide if we should respond
+    if (!shouldRespond(userId, content)) {
       logEvent('ignore_api', { userId, message: content });
       return;
     }
 
-    // Generate and send response
+    // 3) Start typing to indicate processing
     await message.channel.sendTyping();
+
+    // ---- DELAY TIMER LOGIC ----
+    // Set a timer to fire if the LLM response is slow
+    const TIMEOUT_MS = 15000; // 15 seconds, for example
+    let snailReaction;       // store the reaction if you want to remove later
+
+    const slowResponseTimer = setTimeout(async () => {
+      try {
+        snailReaction = await message.react('🐌'); 
+        console.log("Delay in DEEPSEEK response. Reacting with a Snail");
+        // or whatever emoji you want for "delay"
+      } catch (err) {
+        console.log("Couldn't add slow reaction:", err);
+      }
+    }, TIMEOUT_MS);
+    // ---------------------------
+
+    // 4) Generate the response (LLM call)
     const botReply = await generateResponse(userId, message);
 
+    // Clear the slow response timer once LLM finishes
+    clearTimeout(slowResponseTimer);
+
+    // (Optional) If you want to remove the "delay" reaction
+    //snailReaction?.remove().catch(err => console.log("Couldn't remove snail reaction:", err));
+
+    // 5) Send the final reply
     await message.reply({
       content: botReply,
       allowedMentions: { repliedUser: false }
     });
 
-    // Update user cooldown
+    // Update cooldown
     userCooldowns.set(userId, Date.now());
   } catch (error) {
     logEvent('error', {
