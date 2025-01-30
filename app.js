@@ -1,3 +1,18 @@
+/**
+ * @fileoverview Yue Discord Bot
+ * 
+ * This file implements a single-conversation Discord bot named Yue. 
+ * Yue responds to messages that mention certain keywords or the bot itself via @BotName. 
+ * It also maintains shared conversation history and long-term memory across all users.
+ * 
+ * @author 
+ *   Jairo Gonzalez (contacto [at] estejairo.cl)
+ * @version 
+ *   1.0
+ * @since 
+ *   2025-01-30
+ */
+
 import 'dotenv/config';
 import { Client, GatewayIntentBits } from 'discord.js';
 import OpenAI from 'openai';
@@ -5,7 +20,8 @@ import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // -----------------------------------
 // Configuration
@@ -15,18 +31,37 @@ const HISTORY_FILE = path.join(__dirname, 'chat_history.json');
 const LOG_FILE = path.join(__dirname, 'log.txt');
 const COOLDOWN_MS = 8000;
 const MAX_HISTORY_LENGTH = 30;
-const SUMMARY_INTERVAL = 15; // Summarize less often
+const SUMMARY_INTERVAL = 15; 
 const LONG_TERM_MEMORY_FILE = path.join(__dirname, 'long_term_memory.json');
-const MAX_TOKENS = 6000;
 
-const REPLY_MAX_TOKENS = 600; // Reduced tokens for replies
+// Doubling the token limits for replies and conversation context
+const MAX_TOKENS = 12000;
+const REPLY_MAX_TOKENS = 1200; 
 
-// Save intervals (milliseconds)
-const SAVE_HISTORY_INTERVAL = 1 * 60 * 1000; // 1 minute
-const SAVE_MEMORY_INTERVAL = 15 * 60 * 1000; // 15 minutes
+// Save intervals (in milliseconds)
+const SAVE_HISTORY_INTERVAL = 60_000;  // 1 minute
+const SAVE_MEMORY_INTERVAL = 15 * 60_000; // 15 minutes
 
 // -----------------------------------
-// Initialize clients
+// Override console.log to also log to log.txt
+// -----------------------------------
+const originalConsoleLog = console.log;
+console.log = async function(...args) {
+  const message = args.join(' ');
+  const timestamp = new Date().toISOString();
+  const logEntry = `[${timestamp}] [LOG] ${message}\n`;
+  // Write to log.txt
+  try {
+    await fs.appendFile(LOG_FILE, logEntry);
+  } catch (error) {
+    originalConsoleLog('Error writing to log file:', error);
+  }
+  // Print to console
+  originalConsoleLog(...args);
+};
+
+// -----------------------------------
+// Initialize Discord and OpenAI clients
 // -----------------------------------
 const discordClient = new Client({
   intents: [
@@ -36,6 +71,7 @@ const discordClient = new Client({
   ]
 });
 
+/** @type {OpenAI} */
 const deepseek = new OpenAI({
   baseURL: 'https://api.deepseek.com',
   apiKey: process.env.DEEPSEEK_API_KEY
@@ -44,28 +80,53 @@ const deepseek = new OpenAI({
 // -----------------------------------
 // State management
 // -----------------------------------
+/**
+ * Global conversation history array, shared by all users.
+ * @type {Array<Object>}
+ */
+let chatHistory = [];
+
+/**
+ * Shared long-term memory object.
+ * Contains knownUsers, summaries, and facts.
+ */
+let longTermMemory = {
+  knownUsers: {},  // userId -> { currentUsername, previousUsernames: [] }
+  summaries: [],
+  facts: []
+};
+
 const userCooldowns = new Map();
-let chatHistory = {};
 let isShuttingDown = false;
-let longTermMemory = {};
 
 // -----------------------------------
 // Helper functions
 // -----------------------------------
+
+/**
+ * Estimates the number of tokens based on text length.
+ *
+ * @param {string} text - The text to estimate
+ * @returns {number} Number of tokens (approximation)
+ */
 function estimateTokens(text) {
-  // Rough token estimation
   return Math.ceil(text.length / 4);
 }
 
+/**
+ * Trims the conversation messages to stay under MAX_TOKENS.
+ *
+ * @param {Array<{role:string, content:string}>} messages - The messages to optimize
+ * @returns {Array<{role:string, content:string}>} Optimized messages
+ */
 function optimizeTokenUsage(messages) {
   let tokenCount = 0;
   const optimized = [];
 
-  // Start from the end and add to the front
+  // Start from the last message (most recent)
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
     const tokens = estimateTokens(msg.content);
-
     if (tokenCount + tokens > MAX_TOKENS) break;
 
     optimized.unshift(msg);
@@ -74,6 +135,12 @@ function optimizeTokenUsage(messages) {
   return optimized;
 }
 
+/**
+ * Formats the chat history to be suitable for the AI model.
+ *
+ * @param {Array} history - The global chat history
+ * @returns {Array} The formatted messages
+ */
 function formatHistoryForAI(history) {
   return history.map(entry => ({
     role: entry.role,
@@ -83,15 +150,24 @@ function formatHistoryForAI(history) {
   }));
 }
 
+/**
+ * Builds a string with known users, summaries, and facts from memory.
+ *
+ * @param {Array} history - The conversation history
+ * @param {Object} memory - The long term memory object
+ * @returns {string} The combined context string
+ */
 function buildConversationContext(history, memory) {
   const parts = [];
-
-  parts.push("Usuarios conocidos:");
-  Object.entries(memory.knownUsers || {}).forEach(([id, data]) => {
-    parts.push(
-      `- ${data.currentUsername} (ID: ${id}, Nombres anteriores: ${data.previousUsernames.join(', ')})`
-    );
-  });
+  parts.push("Known Users:");
+  if (memory.knownUsers) {
+    Object.entries(memory.knownUsers).forEach(([id, data]) => {
+      const prevNames = (data.previousUsernames || []).join(', ');
+      parts.push(
+        `- ${data.currentUsername} (ID: ${id}, Nombres anteriores: ${prevNames})`
+      );
+    });
+  }
 
   if (memory.summaries?.length > 0) {
     parts.push("\nResúmenes de conversaciones anteriores:");
@@ -109,15 +185,31 @@ function buildConversationContext(history, memory) {
 // -----------------------------------
 // Memory Management
 // -----------------------------------
+
+/**
+ * Loads the long-term memory from file.
+ *
+ * @returns {Promise<void>}
+ */
 async function loadLongTermMemory() {
   try {
     const data = await fs.readFile(LONG_TERM_MEMORY_FILE, 'utf-8');
     longTermMemory = JSON.parse(data);
   } catch {
-    longTermMemory = {};
+    // If file not found or invalid, keep defaults
+    longTermMemory = {
+      knownUsers: {},
+      summaries: [],
+      facts: []
+    };
   }
 }
 
+/**
+ * Saves the long-term memory to file.
+ *
+ * @returns {Promise<void>}
+ */
 async function saveLongTermMemory() {
   if (isShuttingDown) return;
 
@@ -129,18 +221,35 @@ async function saveLongTermMemory() {
   }
 }
 
-async function condenseConversation(userId) {
-  try {
-    const history = chatHistory[userId] || [];
-    const memory = longTermMemory[userId] || { summaries: [], facts: [] };
+// -----------------------------------
+// Conversation Condensation
+// -----------------------------------
 
-    // Only process if there's enough messages
+/**
+ * Condenses the last SUMMARY_INTERVAL messages into summaries and facts using DeepSeek.
+ *
+ * @returns {Promise<void>}
+ */
+async function condenseConversation() {
+  try {
+    const history = chatHistory || [];
+    const memory = longTermMemory;
+
+    // Grab the last N messages for summarization
     const conversationText = history
       .slice(-SUMMARY_INTERVAL)
-      .map(entry => `${entry.username}: ${entry.content}`)
+      .map(entry => {
+        let name;
+        if (entry.role === "assistant") {
+          name = "[Yue#1234]"; 
+        } else {
+          name = entry.username; // normal users
+        }
+        return `${name} said: ${entry.content}`;
+      })
       .join('\n');
 
-    // Summarize conversation
+    // Summarize via DeepSeek
     const summaryResponse = await deepseek.chat.completions.create({
       messages: [{
         role: "user",
@@ -154,7 +263,7 @@ async function condenseConversation(userId) {
     const newSummary = summaryResponse.choices[0].message.content;
     memory.summaries = [...(memory.summaries || []), newSummary].slice(-3);
 
-    // Extract facts (optional)
+    // Extract important facts
     const factResponse = await deepseek.chat.completions.create({
       messages: [{
         role: "user",
@@ -170,21 +279,21 @@ async function condenseConversation(userId) {
       .map(f => f.trim())
       .filter(Boolean);
 
-    memory.facts = [...new Set([...(memory.facts || []), ...newFacts])].slice(-10);
+    // Merge new facts, avoiding duplicates
+    memory.facts = [
+      ...new Set([...(memory.facts || []), ...newFacts])
+    ].slice(-10);
 
-    // Update state
-    longTermMemory[userId] = memory;
-    chatHistory[userId] = history.slice(-SUMMARY_INTERVAL);
+    // Truncate the global history
+    chatHistory = history.slice(-SUMMARY_INTERVAL);
 
     logEvent('memory_condense', {
-      userId,
       summaries: memory.summaries.length,
       facts: memory.facts.length
     });
   } catch (error) {
     logEvent('error', {
       type: 'memory_condense',
-      userId,
       error: error.message
     });
   }
@@ -193,32 +302,47 @@ async function condenseConversation(userId) {
 // -----------------------------------
 // Logging
 // -----------------------------------
+
+/**
+ * Appends an event log entry to log.txt and console.
+ *
+ * @param {string} type - The event type/category
+ * @param {Object} details - Additional info about the event
+ * @returns {void}
+ */
 function logEvent(type, details) {
   const timestamp = new Date().toISOString();
   const logEntry = `[${timestamp}] [${type.toUpperCase()}] ${JSON.stringify(details)}\n`;
 
   fs.appendFile(LOG_FILE, logEntry)
     .then(() => {
-      console.log(logEntry);
+      // Show in console (already overridden)
+      originalConsoleLog(logEntry);
     })
     .catch((error) => {
-      console.error('Logging error:', error);
+      originalConsoleLog('Logging error:', error);
     });
 }
 
 // -----------------------------------
 // History Management
 // -----------------------------------
+
+/**
+ * Loads chat history from file.
+ *
+ * @returns {Promise<void>}
+ */
 async function loadHistory() {
   try {
     const data = await fs.readFile(HISTORY_FILE, 'utf-8');
     chatHistory = JSON.parse(data);
     logEvent('history', {
       status: 'loaded',
-      entries: Object.keys(chatHistory).length
+      entries: chatHistory.length
     });
   } catch (error) {
-    chatHistory = {};
+    chatHistory = [];
     logEvent('history', {
       status: 'created',
       error: error.message
@@ -226,6 +350,11 @@ async function loadHistory() {
   }
 }
 
+/**
+ * Saves the current chat history to file.
+ *
+ * @returns {Promise<void>}
+ */
 async function saveHistory() {
   if (isShuttingDown) return;
 
@@ -233,7 +362,7 @@ async function saveHistory() {
     await fs.writeFile(HISTORY_FILE, JSON.stringify(chatHistory, null, 2));
     logEvent('history', {
       status: 'saved',
-      entries: Object.keys(chatHistory).length
+      entries: chatHistory.length
     });
   } catch (error) {
     logEvent('error', {
@@ -247,25 +376,41 @@ async function saveHistory() {
 // -----------------------------------
 // Shutdown Handler
 // -----------------------------------
+
+/**
+ * Performs a clean shutdown: saves history, memory, destroys Discord client, and exits.
+ *
+ * @returns {Promise<void>}
+ */
 async function shutdown() {
   if (isShuttingDown) return;
   isShuttingDown = true;
 
+  console.log("🔴 [SHUTDOWN] Starting shutdown sequence...");
   logEvent('system', { status: 'shutdown_started' });
 
   try {
+    console.log("🛑 [SHUTDOWN] Clearing intervals...");
     clearInterval(historyInterval);
     clearInterval(memoryInterval);
 
-    // Save on shutdown
+    console.log("💾 [SHUTDOWN] Saving history...");
     await saveHistory();
+
+    console.log("📁 [SHUTDOWN] Saving long-term memory...");
     await saveLongTermMemory();
 
-    discordClient.destroy();
+    console.log("🔌 [SHUTDOWN] Disconnecting from Discord...");
+    await discordClient.destroy();
+
+    console.log("✅ [SHUTDOWN] Shutdown complete. Exiting...");
     logEvent('system', { status: 'discord_disconnected' });
 
+    // Wait a moment to ensure logs are written
+    await new Promise(res => setTimeout(res, 500));
     process.exit(0);
   } catch (error) {
+    console.log("🚨 [SHUTDOWN] Error:", error);
     logEvent('error', {
       type: 'shutdown_error',
       error: error.message,
@@ -275,6 +420,7 @@ async function shutdown() {
   }
 }
 
+// Register OS signals for graceful shutdown
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 process.on('uncaughtException', async (error) => {
@@ -289,67 +435,45 @@ process.on('uncaughtException', async (error) => {
 // -----------------------------------
 // 1) Decision: Should Respond?
 // -----------------------------------
-function shouldRespond(userId, messageContent) {
-  // 1) Define rules and parameters
-  const THIRTY_SECONDS = 30 * 1000; 
+
+/**
+ * Checks whether the bot should respond based on mentions or keywords.
+ *
+ * @param {import('discord.js').Message} message - The message object
+ * @returns {boolean} True if the bot should reply
+ */
+function shouldRespond(message) {
+  // If the bot hasn't identified its user yet, do nothing
+  if (!discordClient.user) return false;
+
+  const userId = message.author.id;
+  const contentLower = message.content.toLowerCase();
   const now = Date.now();
-  // Lowercase for simpler checks
-  const contentLower = messageContent.toLowerCase();
+  const THIRTY_SECONDS = 30_000;
 
-  // Topics or user-mentions that should trigger a response
-  const keywords = [
-    // Bot name or direct mention
-    "yue", 
-    // Known members or relevant references:
-    //"mankeke", "herni", "teto", "jairo", "kari", "max", "daniel",
-    //"ledah0306", "estejairo", "hillevistka", "herni_o", "tetitowo",
-    //"dnl.trrs", "clezzo",
-    // Relevant topics:
-    //"videojuego", "videojuegos", "pelicula", "películas", "geek", 
-    //"anime", "música", "music", "twitch", "discord", "tecnología", 
-    //"tecnologia"
-  ];
+  // Check for direct mention
+  const botMentioned = message.mentions.has(discordClient.user.id);
 
-  // 2) Get the user's recent history (last 30 seconds)
-  const fullHistory = chatHistory[userId] || [];
-  const recentHistory = fullHistory.filter(msg => {
+  // Check for keywords
+  const keywords = ["yue"];
+  const keywordTriggered = keywords.some(kw => contentLower.includes(kw));
+
+  // Quick heuristic for continuing conversation
+  const recentHistory = chatHistory.filter(msg => {
     const msgTime = new Date(msg.timestamp).getTime();
     return (now - msgTime) <= THIRTY_SECONDS;
   });
+  let continuingConversation = false; // can be refined as needed
 
-  // 3) Check if the last message is from the assistant or the user
-  //    and occurred within 30 seconds (a "continuing conversation")
-  let continuingConversation = false;
+  // Combine logic to decide
+  const shouldSayYes = (botMentioned || continuingConversation || keywordTriggered);
 
-  // if (recentHistory.length > 0) {
-  //   const lastMsg = recentHistory[recentHistory.length - 1];
-  //   // If the last message is from the assistant or the user themselves,
-  //   // within 30 seconds, assume it's a continuation
-  //   if ((lastMsg.role === "assistant" || lastMsg.role === "user") && 
-  //       (now - new Date(lastMsg.timestamp).getTime()) <= THIRTY_SECONDS) {
-  //     continuingConversation = true;
-  //   }
-  // }
-
-  // 4) Check keyword triggers in the user’s new message
-  let keywordTriggered = false;
-  for (const kw of keywords) {
-    if (contentLower.includes(kw)) {
-      keywordTriggered = true;
-      break;
-    }
-  }
-
-  // 5) Combine logic to decide "SÍ" or "NO"
-  //    If continuing conversation OR keyword triggered => respond
-  const shouldSayYes = (continuingConversation || keywordTriggered);
-
-  // Log for debugging
   logEvent('detection_local', {
     userId,
-    message: messageContent,
+    message: contentLower,
     continuingConversation,
     keywordTriggered,
+    botMentioned,
     decision: shouldSayYes
   });
 
@@ -359,72 +483,82 @@ function shouldRespond(userId, messageContent) {
 // -----------------------------------
 // 2) Generate Bot Response
 // -----------------------------------
-async function generateResponse(userId, message) {
+
+/**
+ * Calls DeepSeek API to generate a response, updates the shared conversation history,
+ * and returns the bot's message.
+ *
+ * @param {import('discord.js').Message} message - The incoming Discord message
+ * @returns {Promise<string>} The response from the bot
+ */
+async function generateResponse(message) {
   try {
+    const userId = message.author.id;
     const userTag = message.author.tag;
     const username = message.author.username;
     const content = message.content;
 
-    let userHistory = chatHistory[userId] || [];
-    const memory = longTermMemory[userId] || {
-      summaries: [],
-      facts: [],
-      knownUsers: {}
-    };
+    // Ensure memory structures
+    if (!longTermMemory.knownUsers) longTermMemory.knownUsers = {};
+    if (!longTermMemory.summaries) longTermMemory.summaries = [];
+    if (!longTermMemory.facts) longTermMemory.facts = [];
 
-    // Track user info
-    memory.knownUsers[userId] = {
-      currentUsername: username,
-      previousUsernames: [
-        ...(memory.knownUsers[userId]?.previousUsernames || []),
-        username
-      ].filter((v, i, a) => a.indexOf(v) === i)
-    };
+    // Register user info
+    if (!longTermMemory.knownUsers[userId]) {
+      longTermMemory.knownUsers[userId] = {
+        currentUsername: username,
+        previousUsernames: []
+      };
+    }
+    const knownUserInfo = longTermMemory.knownUsers[userId];
+    if (!knownUserInfo.previousUsernames.includes(username)) {
+      knownUserInfo.previousUsernames.push(username);
+    }
+    knownUserInfo.currentUsername = username;
 
     // Condense conversation if needed
-    if (userHistory.length >= SUMMARY_INTERVAL) {
-      await condenseConversation(userId);
-      userHistory = chatHistory[userId] || [];
+    if (chatHistory.length >= SUMMARY_INTERVAL) {
+      await condenseConversation();
     }
 
-    // Add new user message
-    userHistory.push({
+    // Add user's new message to global chat history
+    chatHistory.push({
       role: "user",
       username: userTag,
       content,
       timestamp: new Date().toISOString()
     });
 
-    // Prepare context
+    // Build conversation context
     const contextMessages = [
       {
         role: "system",
         content: `Eres Yue, uno de los Guardianes de las Cartas Clow en Sakura Card Captor y del servidor de Discord Hogar Kawaii (Kawaii Gaming House o KGH).
-        - Te especializas como guardián y asistente de este servidor. Sabes de videojuegos, películas, cultura geek, anime, música, Twitch, Discord y tecnología. También puedes responder preguntas de cultura general. Si el usuario hace una pregunta fuera de estos temas, responde con brevedad y explica que no te interesa abordar ese tema.
-        - Tus repuestas son misteriosas, muy cortas y casuales, en español. Evita repetir constantemente las mismas sugerencias, repetir frases, o repetir emojis, u ofrecer información no solicitada. 
+        - Te especializas como guardian y asistente de este servidor. Sabes de videojuegos, peliculas, cultura geek, anime, musica, twitch, discord y tecnologia. También puedes responder preguntas de cultura general. Si el usuario hace una pregunta fuera de estos temas, responde con brevedad y explica que no te interesa abordar ese tema.
+        - Tus repuestas son misteriosas, muy cortas y casuales, en español.
         - Hora actual: ${new Date().toLocaleString()}
-        - Resúmenes conversacionales: ${memory.summaries.join('\n')}
-        - Datos recordados: ${memory.facts.join('\n')}
+        - Resúmenes conversacionales: ${longTermMemory.summaries.join('\n')}
+        - Datos recordados: ${longTermMemory.facts.join('\n')}
         
         Personalidad:
           - Seriedad y Dignidad: Rara vez muestras emociones abiertamente.
           - Lealtad a Clow Reed y a @estejairo (jairo): sientes respeto por tus creadores.
           - Confianza en tus Habilidades: eres un guardián poderoso y confiado.
           - Sensibilidad Oculta: tienes un lado emocional más profundo, relacionado con Yukito.
-          - Reservado pero Protector: tienes un instinto protector por quienes consideras importantes, especialmente @hillevistka (también llamada Kari, Karinna, o Hillevi).
-          - Sabes que @ledah0306 (mankeke) suele ser torpe y te burlas cordial y sutilmente de él cuando es mencionado o cuando él habla.
+          - Reservado pero Protector: tienes un instinto protector por quienes consideras importantes, especialmente @hillevistka (tambien conocida como Kari, Karinna o Hillevi).
+          - Sabes que @ledah0306 (mankeke) suele ser torpe y te burlas cordial y sutilmente de el cuando es mencionado o cuando él habla.
           - Personalidad: seria, distante y solemne, con un humor irónico y sarcástico.
         
         Contexto de conversación (los usuarios se muestran como [Nombre#1234]):
-        - ${buildConversationContext(userHistory, memory)}`
+${buildConversationContext(chatHistory, longTermMemory)}`
       },
-      ...formatHistoryForAI(userHistory)
+      ...formatHistoryForAI(chatHistory)
     ];
 
-    // Optimize messages to stay under token limit
+    // Optimize message array to stay within token limit
     const optimizedMessages = optimizeTokenUsage(contextMessages);
 
-    // Generate final response
+    // Request to DeepSeek
     const response = await deepseek.chat.completions.create({
       messages: optimizedMessages,
       model: "deepseek-chat",
@@ -432,21 +566,25 @@ async function generateResponse(userId, message) {
       temperature: 0.9
     });
 
+    if (!response || !response.choices || response.choices.length === 0) {
+      throw new Error("DeepSeek API returned no valid response.");
+    }
+
     const botReply = response.choices[0].message.content;
 
-    // Update history with the assistant response
-    userHistory.push({
+    // Add bot's response to chat history
+    chatHistory.push({
       role: "assistant",
       content: botReply,
       timestamp: new Date().toISOString()
     });
 
-    // Trim to max history length
-    chatHistory[userId] = userHistory.slice(-MAX_HISTORY_LENGTH);
-    longTermMemory[userId] = memory;
+    // Trim history to avoid overflow
+    if (chatHistory.length > MAX_HISTORY_LENGTH) {
+      chatHistory = chatHistory.slice(-MAX_HISTORY_LENGTH);
+    }
 
     logEvent('response', {
-      userId,
       message: content,
       response: botReply,
       tokens: response.usage?.total_tokens
@@ -455,26 +593,27 @@ async function generateResponse(userId, message) {
     return botReply;
   } catch (error) {
     logEvent('error', {
-      type: 'response_error',
-      userId,
+      type: 'deepseek_response',
       error: error.message,
       stack: error.stack
     });
-    return "Estoy agotado ahora, hablemos nuevamente más tarde.";
+
+    return "Lo siento, hubo un problema con mi conexión a la IA. Intenta de nuevo más tarde. 🌙";
   }
 }
 
 // -----------------------------------
 // 3) Discord Client Setup
 // -----------------------------------
+
 discordClient.on('messageCreate', async (message) => {
   if (message.author.bot || isShuttingDown) return;
 
   const userId = message.author.id;
-  const content = message.content.toLowerCase();
+  const content = message.content;
 
   try {
-    // 1) Cooldown check
+    // Cooldown check
     if (userCooldowns.has(userId)) {
       const lastTime = userCooldowns.get(userId);
       if (Date.now() - lastTime < COOLDOWN_MS) {
@@ -484,41 +623,34 @@ discordClient.on('messageCreate', async (message) => {
       }
     }
 
-    // 2) Decide if we should respond
-    if (!shouldRespond(userId, content)) {
+    // Decide whether to respond
+    if (!shouldRespond(message)) {
       logEvent('ignore_api', { userId, message: content });
       return;
     }
 
-    // 3) Start typing to indicate processing
+    // Indicate typing
     await message.channel.sendTyping();
 
-    // ---- DELAY TIMER LOGIC ----
-    // Set a timer to fire if the LLM response is slow
-    const TIMEOUT_MS = 15000; // 15 seconds, for example
-    let snailReaction;       // store the reaction if you want to remove later
-
+    // Timer for slow responses
+    const TIMEOUT_MS = 15000; // 15 seconds
+    let snailReaction;
     const slowResponseTimer = setTimeout(async () => {
       try {
-        snailReaction = await message.react('🐌'); 
-        console.log("Delay in DEEPSEEK response. Reacting with a Snail");
-        // or whatever emoji you want for "delay"
+        snailReaction = await message.react('🐌');
+        console.log("Delay in DeepSeek response. Added 🐌 reaction.");
       } catch (err) {
-        console.log("Couldn't add slow reaction:", err);
+        console.log("Could not add snail reaction:", err);
       }
     }, TIMEOUT_MS);
-    // ---------------------------
 
-    // 4) Generate the response (LLM call)
-    const botReply = await generateResponse(userId, message);
+    // Generate and send the bot's response
+    const botReply = await generateResponse(message);
 
-    // Clear the slow response timer once LLM finishes
     clearTimeout(slowResponseTimer);
+    // Optionally remove the snail reaction if desired
+    snailReaction?.remove().catch(() => {});
 
-    // (Optional) If you want to remove the "delay" reaction
-    //snailReaction?.remove().catch(err => console.log("Couldn't remove snail reaction:", err));
-
-    // 5) Send the final reply
     await message.reply({
       content: botReply,
       allowedMentions: { repliedUser: false }
@@ -540,6 +672,7 @@ discordClient.on('messageCreate', async (message) => {
 // -----------------------------------
 // 4) Initialize and Start
 // -----------------------------------
+
 await loadHistory();
 await loadLongTermMemory();
 
