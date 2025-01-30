@@ -320,15 +320,16 @@ function shouldRespond(userId, messageContent) {
   // 3) Check if the last message is from the assistant or the user
   //    and occurred within 30 seconds (a "continuing conversation")
   let continuingConversation = false;
-  if (recentHistory.length > 0) {
-    const lastMsg = recentHistory[recentHistory.length - 1];
-    // If the last message is from the assistant or the user themselves,
-    // within 5 minutes, assume it's a continuation
-    if ((lastMsg.role === "assistant" || lastMsg.role === "user") && 
-        (now - new Date(lastMsg.timestamp).getTime()) <= THIRTY_SECONDS) {
-      continuingConversation = true;
-    }
-  }
+
+  // if (recentHistory.length > 0) {
+  //   const lastMsg = recentHistory[recentHistory.length - 1];
+  //   // If the last message is from the assistant or the user themselves,
+  //   // within 30 seconds, assume it's a continuation
+  //   if ((lastMsg.role === "assistant" || lastMsg.role === "user") && 
+  //       (now - new Date(lastMsg.timestamp).getTime()) <= THIRTY_SECONDS) {
+  //     continuingConversation = true;
+  //   }
+  // }
 
   // 4) Check keyword triggers in the user’s new message
   let keywordTriggered = false;
