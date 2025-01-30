@@ -301,16 +301,16 @@ function shouldRespond(userId, messageContent) {
     // Bot name or direct mention
     "yue", 
     // Known members or relevant references:
-    "mankeke", "herni", "teto", "jairo", "kari", "max", "daniel",
-    "ledah0306", "estejairo", "hillevistka", "herni_o", "tetitowo",
-    "dnl.trrs", "clezzo",
+    //"mankeke", "herni", "teto", "jairo", "kari", "max", "daniel",
+    //"ledah0306", "estejairo", "hillevistka", "herni_o", "tetitowo",
+    //"dnl.trrs", "clezzo",
     // Relevant topics:
-    "videojuego", "videojuegos", "pelicula", "películas", "geek", 
-    "anime", "música", "music", "twitch", "discord", "tecnología", 
-    "tecnologia"
+    //"videojuego", "videojuegos", "pelicula", "películas", "geek", 
+    //"anime", "música", "music", "twitch", "discord", "tecnología", 
+    //"tecnologia"
   ];
 
-  // 2) Get the user's recent history (last 5 minutes)
+  // 2) Get the user's recent history (last 30 seconds)
   const fullHistory = chatHistory[userId] || [];
   const recentHistory = fullHistory.filter(msg => {
     const msgTime = new Date(msg.timestamp).getTime();
@@ -318,7 +318,7 @@ function shouldRespond(userId, messageContent) {
   });
 
   // 3) Check if the last message is from the assistant or the user
-  //    and occurred within 5 minutes (a "continuing conversation")
+  //    and occurred within 30 seconds (a "continuing conversation")
   let continuingConversation = false;
   if (recentHistory.length > 0) {
     const lastMsg = recentHistory[recentHistory.length - 1];
