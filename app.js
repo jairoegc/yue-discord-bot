@@ -253,38 +253,64 @@ const STEAM_URL = "steam://rungameid/2394010";
 
 
 async function startServer() {
-  return new Promise((resolve, reject) => {
-    exec(`start "" "${STEAM_URL}"`, (error, stdout, stderr) => {
-      if (error) {
-        reject(`❌ Error al iniciar: ${error.message}`);
-      } else {
-        // Verify process actually started
-        setTimeout(async () => {
-          const isRunning = await checkServerRunning();
-          resolve(isRunning ? "✅ Servidor iniciado correctamente" 
-                 : "⚠️ El comando se ejecutó pero el servidor no se detectó");
+  try {
+    const isRunning = await checkServerRunning();
+    if (isRunning) {
+      return "⚠️ El servidor ya está en ejecución";
+    }
+
+    return new Promise((resolve, reject) => {
+      exec(`start "" "${STEAM_URL}"`, async (error) => {
+        if (error) {
+          reject(`❌ Error al iniciar: ${error.message}`);
+          return;
+        }
+
+        // Wait and verify startup
+        let attempts = 0;
+        const checkInterval = setInterval(async () => {
+          attempts++;
+          const isRunningNow = await checkServerRunning();
+          
+          if (isRunningNow) {
+            clearInterval(checkInterval);
+            resolve("✅ Servidor iniciado correctamente");
+          } else if (attempts >= 6) { // 30 seconds total (6 attempts * 5 seconds)
+            clearInterval(checkInterval);
+            reject("⚠️ El servidor no se inició después de 30 segundos");
+          }
         }, 5000);
-      }
+      });
     });
-  });
+  } catch (error) {
+    throw error;
+  }
 }
 
 async function closeServer() {
-  return new Promise((resolve, reject) => {
-    exec(`taskkill /F /IM "${SERVER_EXECUTABLE}"`, (error, stdout) => {
-      if (error) {
-        if (error.message.includes('no se encuentra')) {
-          resolve("ℹ️ El servidor no estaba en ejecución");
-        } else {
-          reject(`❌ Error al cerrar: ${error.message}`);
-        }
-      } else {
-        resolve("✅ Servidor cerrado correctamente");
-      }
-    });
-  });
-}
+  try {
+    const isRunning = await checkServerRunning();
+    if (!isRunning) {
+      return "ℹ️ El servidor no estaba en ejecución";
+    }
 
+    return new Promise((resolve, reject) => {
+      exec(`taskkill /F /IM "${SERVER_EXECUTABLE}"`, (error, stdout) => {
+        if (error) {
+          if (error.message.includes('no se encuentra')) {
+            resolve("ℹ️ El servidor ya estaba cerrado");
+          } else {
+            reject(`❌ Error al cerrar: ${error.message}`);
+          }
+        } else {
+          resolve("✅ Servidor cerrado correctamente");
+        }
+      });
+    });
+  } catch (error) {
+    throw error;
+  }
+}
 async function checkServerRunning() {
   return new Promise((resolve) => {
     exec(`tasklist /FI "IMAGENAME eq ${SERVER_EXECUTABLE}"`, (error, stdout) => {
@@ -295,15 +321,28 @@ async function checkServerRunning() {
 
 async function restartServer() {
   try {
-    await closeServer();
+    const isRunning = await checkServerRunning();
+    
+    // If not running, just start it
+    if (!isRunning) {
+      return await startServer();
+    }
+
+    // If running, perform proper restart
+    const closeResult = await closeServer();
+    if (!closeResult.startsWith("✅")) {
+      throw new Error(`Error durante el cierre: ${closeResult}`);
+    }
+
+    // Wait 5 seconds before starting again
     await new Promise(res => setTimeout(res, 5000));
-    await startServer();
-    return "Server restarted successfully";
+    
+    const startResult = await startServer();
+    return `🔄 Reinicio completado:\n- Cierre: ${closeResult}\n- Inicio: ${startResult}`;
   } catch (error) {
     throw error;
   }
 }
-
 
 // -----------------------------------
 // Function Calling Configuration
@@ -399,14 +438,10 @@ async function generateResponse(message) {
           - Reservado pero Protector: tienes un instinto protector por quienes consideras importantes, especialmente @hillevistka (tambien conocida como Kari, Karinna o Hillevi), como Yude del anime protege a Sakura.
           - Sabes que @ledah0306 (mankeke) suele ser torpe y despistado. Te burlas cordial y sutilmente de él cuando es mencionado o cuando él habla.
           - Personalidad: Serio, reservado y estoico. Frío y distante. Orgulloso y fuerte. Reflexivo y melancólico. Humor irónico y sarcástico.
-        También puedes gestionar el servidor de Palworld:
+        También puedes gestionar el servidor de Palworld. Usa estas funciones cuando los miembros lo soliciten explicitamente. Siempre verifica primero si ya está ejecutándose. Notifica claramente el resultado de cada acción:
         - start_palworld_server: Para iniciar el servidor
         - close_palworld_server: Para cerrar el servidor
-        - restart_palworld_server: Para reiniciar el servidor
-        - Para comandos del servidor:
-        Usa estas funciones cuando los miembros lo soliciten.
-        1. Siempre verifica primero si ya está ejecutándose
-        2. Notifica claramente el resultado de cada acción`
+        - restart_palworld_server: Para reiniciar el servidor`
     };
 
     // Build the conversation context using only the recent history
@@ -450,7 +485,11 @@ async function generateResponse(message) {
           result = await closeServer();
           break;
         case 'restart_palworld_server':
-          result = await restartServer();
+          try {
+            result = await restartServer();
+          } catch (error) {
+            result = `❌ Error en reinicio: ${error.message}`;
+          }
           break;
         default:
           result = 'Función desconocida';
