@@ -244,6 +244,21 @@ process.on('uncaughtException', async (error) => {
   await shutdown();
 });
 
+// -----------------------------------
+// Server Command Detection
+// -----------------------------------
+const SERVER_COMMANDS = {
+  start: ["iniciar servidor", "start server", "arranca el servidor", "prende el servidor"],
+  stop: ["cerrar servidor", "stop server", "apaga el servidor", "detener servidor"],
+  restart: ["reiniciar servidor", "restart server", "reinicia el servidor"]
+};
+
+function isServerCommand(message) {
+  const contentLower = message.content.toLowerCase();
+  return Object.values(SERVER_COMMANDS).some(commands => 
+    commands.some(cmd => contentLower.includes(cmd))
+  );
+}
 
 // -----------------------------------
 // Palworld Server Management
@@ -438,7 +453,7 @@ async function generateResponse(message) {
           - Reservado pero Protector: tienes un instinto protector por quienes consideras importantes, especialmente @hillevistka (tambien conocida como Kari, Karinna o Hillevi), como Yude del anime protege a Sakura.
           - Sabes que @ledah0306 (mankeke) suele ser torpe y despistado. Te burlas cordial y sutilmente de él cuando es mencionado o cuando él habla.
           - Personalidad: Serio, reservado y estoico. Frío y distante. Orgulloso y fuerte. Reflexivo y melancólico. Humor irónico y sarcástico.
-        También puedes gestionar el servidor de Palworld. Usa estas funciones cuando los miembros lo soliciten explicitamente. Siempre verifica primero si ya está ejecutándose. Notifica claramente el resultado de cada acción:
+        También puedes gestionar el servidor de Palworld. Usa estas funciones SOLO cuando los miembros lo soliciten EXPLÍCITAMENTE. Siempre verifica primero si ya está ejecutándose. Notifica claramente el resultado de cada acción:
         - start_palworld_server: Para iniciar el servidor
         - close_palworld_server: Para cerrar el servidor
         - restart_palworld_server: Para reiniciar el servidor`
@@ -453,24 +468,26 @@ async function generateResponse(message) {
     // Optimize the messages to ensure they are within token limits
     const optimizedMessages = optimizeTokenUsage(contextMessages);
 
+    // Only allow function calls if the message explicitly mentions server commands
+    const allowFunctionCall = isServerCommand(message);
+
     // Trim history to the last MAX_HISTORY_LENGTH messages only
     if (chatHistory.length > MAX_HISTORY_LENGTH) {
       chatHistory = chatHistory.slice(-MAX_HISTORY_LENGTH);
     }
-
     const response = await deepseek.chat.completions.create({
       messages: optimizedMessages,
       model: "deepseek-chat",
       max_tokens: REPLY_MAX_TOKENS,
       temperature: 1.3,
-      tools: tools
+      tools: allowFunctionCall ? tools : undefined // Only include tools if it's a server command
     });
 
     if (!response.choices[0].message) throw new Error("No valid response");
 
     // Handle function calling
     const toolCall = response.choices[0].message.tool_calls?.[0];
-    if (toolCall) {
+    if (toolCall && allowFunctionCall) {
       let result;
       switch (toolCall.function.name) {
         case 'start_palworld_server':
