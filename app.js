@@ -21,6 +21,8 @@ import OpenAI from 'openai';
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { exec } from 'child_process';
+
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -242,6 +244,97 @@ process.on('uncaughtException', async (error) => {
   await shutdown();
 });
 
+
+// -----------------------------------
+// Palworld Server Management
+// -----------------------------------
+const SERVER_EXECUTABLE = "PalServer-Win64-Shipping-Cmd.exe";
+const STEAM_URL = "steam://rungameid/2394010";
+
+
+async function startServer() {
+  return new Promise((resolve, reject) => {
+    exec(`start "" "${STEAM_URL}"`, (error, stdout, stderr) => {
+      if (error) {
+        reject(`❌ Error al iniciar: ${error.message}`);
+      } else {
+        // Verify process actually started
+        setTimeout(async () => {
+          const isRunning = await checkServerRunning();
+          resolve(isRunning ? "✅ Servidor iniciado correctamente" 
+                 : "⚠️ El comando se ejecutó pero el servidor no se detectó");
+        }, 5000);
+      }
+    });
+  });
+}
+
+async function closeServer() {
+  return new Promise((resolve, reject) => {
+    exec(`taskkill /F /IM "${SERVER_EXECUTABLE}"`, (error, stdout) => {
+      if (error) {
+        if (error.message.includes('no se encuentra')) {
+          resolve("ℹ️ El servidor no estaba en ejecución");
+        } else {
+          reject(`❌ Error al cerrar: ${error.message}`);
+        }
+      } else {
+        resolve("✅ Servidor cerrado correctamente");
+      }
+    });
+  });
+}
+
+async function checkServerRunning() {
+  return new Promise((resolve) => {
+    exec(`tasklist /FI "IMAGENAME eq ${SERVER_EXECUTABLE}"`, (error, stdout) => {
+      resolve(stdout.toLowerCase().includes(SERVER_EXECUTABLE.toLowerCase()));
+    });
+  });
+}
+
+async function restartServer() {
+  try {
+    await closeServer();
+    await new Promise(res => setTimeout(res, 5000));
+    await startServer();
+    return "Server restarted successfully";
+  } catch (error) {
+    throw error;
+  }
+}
+
+
+// -----------------------------------
+// Function Calling Configuration
+// -----------------------------------
+const tools = [
+  {
+    type: "function",
+    function: {
+      name: "start_palworld_server",
+      description: "Inicia el servidor Palworld mediante Steam. Verifica si ya está corriendo primero.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "close_palworld_server",
+      description: "Cierra el servidor de Palworld terminando su consola",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "restart_palworld_server",
+      description: "Reinicia el servidor cerrando y volviendo a abrir",
+      parameters: { type: "object", properties: {} }
+    }
+  }
+];
+
 // -----------------------------------
 // 1) Should Respond? (Message filtering)
 // -----------------------------------
@@ -306,7 +399,14 @@ async function generateResponse(message) {
           - Reservado pero Protector: tienes un instinto protector por quienes consideras importantes, especialmente @hillevistka (tambien conocida como Kari, Karinna o Hillevi), como Yude del anime protege a Sakura.
           - Sabes que @ledah0306 (mankeke) suele ser torpe y despistado. Te burlas cordial y sutilmente de él cuando es mencionado o cuando él habla.
           - Personalidad: Serio, reservado y estoico. Frío y distante. Orgulloso y fuerte. Reflexivo y melancólico. Humor irónico y sarcástico.
-        `
+        También puedes gestionar el servidor de Palworld:
+        - start_palworld_server: Para iniciar el servidor
+        - close_palworld_server: Para cerrar el servidor
+        - restart_palworld_server: Para reiniciar el servidor
+        - Para comandos del servidor:
+        Usa estas funciones cuando los miembros lo soliciten.
+        1. Siempre verifica primero si ya está ejecutándose
+        2. Notifica claramente el resultado de cada acción`
     };
 
     // Build the conversation context using only the recent history
@@ -318,31 +418,61 @@ async function generateResponse(message) {
     // Optimize the messages to ensure they are within token limits
     const optimizedMessages = optimizeTokenUsage(contextMessages);
 
-    // Call DeepSeek API for chat completions
+    // Trim history to the last MAX_HISTORY_LENGTH messages only
+    if (chatHistory.length > MAX_HISTORY_LENGTH) {
+      chatHistory = chatHistory.slice(-MAX_HISTORY_LENGTH);
+    }
+
     const response = await deepseek.chat.completions.create({
       messages: optimizedMessages,
       model: "deepseek-chat",
       max_tokens: REPLY_MAX_TOKENS,
-      temperature: 0.9
+      temperature: 1.3,
+      tools: tools
     });
 
-    if (!response || !response.choices || response.choices.length === 0) {
-      throw new Error("DeepSeek API returned no valid response.");
+    if (!response.choices[0].message) throw new Error("No valid response");
+
+    // Handle function calling
+    const toolCall = response.choices[0].message.tool_calls?.[0];
+    if (toolCall) {
+      let result;
+      switch (toolCall.function.name) {
+        case 'start_palworld_server':
+          const isRunning = await checkServerRunning();
+          if (isRunning) {
+            result = "⚠️ El servidor ya está en ejecución";
+          } else {
+            result = await startServer();
+          }
+          break;
+        case 'close_palworld_server':
+          result = await closeServer();
+          break;
+        case 'restart_palworld_server':
+          result = await restartServer();
+          break;
+        default:
+          result = 'Función desconocida';
+      }
+
+      // Append function result to history
+      chatHistory.push({
+        role: "assistant",
+        content: `Ejecutado ${toolCall.function.name}: ${result}`,
+        timestamp: new Date().toISOString()
+      });
+
+      return `✅ Comando ejecutado: ${result}`;
     }
 
+    // Handle normal response
     const botReply = response.choices[0].message.content;
-
-    // Append the bot's response to the conversation history
     chatHistory.push({
       role: "assistant",
       content: botReply,
       timestamp: new Date().toISOString()
     });
-
-    // Trim history to the last MAX_HISTORY_LENGTH messages only
-    if (chatHistory.length > MAX_HISTORY_LENGTH) {
-      chatHistory = chatHistory.slice(-MAX_HISTORY_LENGTH);
-    }
 
     logEvent('response', {
       message: content,
